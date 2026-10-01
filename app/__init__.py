@@ -5,7 +5,11 @@ API：
   GET  /api/state        当前输入 + 方案及有效性
   PUT  /api/inputs       校验并保存输入（非法输入 400，不写库；旧方案失效）
   POST /api/solve        基于已保存输入运行排样搜索
-  GET  /api/export       导出文本裁切单（仅有效 found 方案）
+  GET  /api/export       导出文本裁切单（仅有效的 found/optimal 方案）
+
+两种输入模式：
+  - 单规格模式（旧语义）：顶层 paper_l/paper_w，无 stocks 字段；
+  - 库存模式：stocks=[{l,w,qty,cost}, ...]，搜索总纸价最低的可行排样。
 """
 
 from __future__ import annotations
@@ -92,12 +96,21 @@ def create_app(db_path: str | None = None) -> Flask:
                 return jsonify({"ok": False,
                                 "error": "请先保存输入参数"}), 400
             cfg, h = job["cfg"], job["input_hash"]
-        result = solve(
-            cfg["paper_l"], cfg["paper_w"], cfg["kerf"],
-            cfg["max_sheets"], cfg["max_states"],
-            [{"l": p["l"], "w": p["w"], "qty": p["qty"],
-              "rotatable": p["rotatable"]} for p in cfg["products"]],
-        )
+        if cfg.get("mode") == "stock" or cfg.get("stocks"):
+            result = solve(
+                0, 0, cfg["kerf"], cfg["max_sheets"], cfg["max_states"],
+                [{"l": p["l"], "w": p["w"], "qty": p["qty"],
+                  "rotatable": p["rotatable"]} for p in cfg["products"]],
+                stocks=[{"l": s["l"], "w": s["w"], "qty": s["qty"],
+                         "cost": s["cost"]} for s in cfg["stocks"]],
+            )
+        else:
+            result = solve(
+                cfg["paper_l"], cfg["paper_w"], cfg["kerf"],
+                cfg["max_sheets"], cfg["max_states"],
+                [{"l": p["l"], "w": p["w"], "qty": p["qty"],
+                  "rotatable": p["rotatable"]} for p in cfg["products"]],
+            )
         with conn() as c:
             db.save_solution(c, result["status"], h, result)
             c.commit()
@@ -119,13 +132,21 @@ def create_app(db_path: str | None = None) -> Flask:
                     "error": "方案已失效：输入参数在方案保存后被修改，请重新排样",
                     "stale": True,
                 }), 409
-            if sol["status"] != "found":
-                return jsonify({
-                    "ok": False,
-                    "error": ("搜索预算耗尽，未获得可导出的可行方案"
-                              if sol["status"] == "budget"
-                              else "已穷尽搜索且无解，没有可导出的方案"),
-                }), 409
+            # 可导出：单规格 found；库存模式 optimal / found（后者会标明
+            # 最优性未证实）。
+            if sol["status"] not in ("found", "optimal"):
+                if sol["status"] == "budget":
+                    return jsonify({
+                        "ok": False,
+                        "error": "搜索预算耗尽，未获得可导出的可行方案",
+                    }), 409
+                if sol["status"] == "infeasible":
+                    return jsonify({
+                        "ok": False,
+                        "error": "已穷尽搜索且无解，没有可导出的方案",
+                    }), 409
+                return jsonify({"ok": False,
+                                "error": f"状态 {sol['status']} 不可导出"}), 409
             text = render_cutting_sheet(job["cfg"], job["input_hash"],
                                         sol["result"])
         buf = io.BytesIO(text.encode("utf-8"))
@@ -138,12 +159,22 @@ def create_app(db_path: str | None = None) -> Flask:
 
 # ---------- 裁切单文本 ----------
 def render_cutting_sheet(cfg: dict, h: str, result: dict) -> str:
-    L, W, k = cfg["paper_l"], cfg["paper_w"], cfg["kerf"]
+    k = cfg["kerf"]
+    stock_mode = cfg.get("mode") == "stock" or bool(cfg.get("stocks"))
     lines = []
     lines.append("================ 裁切作业单（贯通式裁切） ================")
     lines.append(f"输入版本: {input_version(h)}")
     lines.append(f"指纹(sha256): {h}")
-    lines.append(f"母纸尺寸: {L} mm x {W} mm")
+    if stock_mode:
+        lines.append("模式: 多规格库存（按总纸价最低搜索）")
+        lines.append("库存规格：")
+        for i, s in enumerate(cfg["stocks"]):
+            lines.append(
+                f"  规格{i}（{s['name']}）: {s['l']}x{s['w']} mm  "
+                f"可用 {s['qty']} 张  单张成本 {s['cost']}")
+    else:
+        lines.append("模式: 单规格母纸")
+        lines.append(f"母纸尺寸: {cfg['paper_l']} mm x {cfg['paper_w']} mm")
     lines.append(f"刀缝宽度: {k} mm")
     lines.append(f"张数上限: {cfg['max_sheets']}    "
                  f"搜索状态数上限: {cfg['max_states']}")
@@ -156,6 +187,26 @@ def render_cutting_sheet(cfg: dict, h: str, result: dict) -> str:
     lines.append("")
     lines.append(f"实际使用母纸: {result['sheets_used']} 张")
     lines.append(f"搜索状态数: {result['states_searched']}")
+
+    if stock_mode:
+        lines.append("")
+        if result.get("optimal"):
+            lines.append("最优性: 已完整穷尽搜索，本方案总纸价已证实为最低"
+                         "（同价时用纸张数最少，并优先使用录入靠前的规格）。")
+        else:
+            lines.append("最优性: 未证实——搜索预算耗尽前仅找到本可行方案，"
+                         "不保证总纸价最低；可调大搜索状态数上限后重新排样。")
+        lines.append(f"总纸价: {result.get('total_cost', 0)}")
+        lines.append("各规格用纸：")
+        usage = {}
+        for si in result.get("sheet_specs", []):
+            usage[si] = usage.get(si, 0) + 1
+        for i, s in enumerate(cfg["stocks"]):
+            used_n = usage.get(i, 0)
+            lines.append(
+                f"  规格{i}（{s['name']}）: 用 {used_n} 张 / 库存 "
+                f"{s['qty']} 张  小计 {used_n * s['cost']}")
+
     lines.append("")
     lines.append("实际成品数量：")
     for i, p in enumerate(cfg["products"]):
@@ -183,7 +234,14 @@ def render_cutting_sheet(cfg: dict, h: str, result: dict) -> str:
     for p in result["pieces"]:
         by_sheet.setdefault(p["sheet"], []).append(p)
     for si in sorted(by_sheet):
-        lines.append(f"-- 第 {si + 1} 张 --")
+        if stock_mode:
+            spec_idx = result["sheet_specs"][si]
+            s = cfg["stocks"][spec_idx]
+            head = (f"-- 第 {si + 1} 张：规格{spec_idx}（{s['name']}）"
+                    f"{s['l']}x{s['w']} mm，单张成本 {s['cost']} --")
+        else:
+            head = f"-- 第 {si + 1} 张 --"
+        lines.append(head)
         for p in by_sheet[si]:
             t = cfg["products"][p["product"]]
             rot = " [旋转]" if p["rotated"] else ""

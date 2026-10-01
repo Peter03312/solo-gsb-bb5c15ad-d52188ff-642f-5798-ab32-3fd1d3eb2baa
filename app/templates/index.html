@@ -30,13 +30,18 @@
     font-size:14px;font-family:inherit}
   input:focus{outline:none;border-color:var(--brand)}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
-  .grid3{display:grid;grid-template-columns:1fr 1fr 70px;gap:0 8px;align-items:end}
   table.prods{width:100%;border-collapse:collapse;margin-top:8px}
   table.prods th,table.prods td{padding:4px 4px;border-bottom:1px solid var(--line);
        font-size:12px;text-align:left}
   table.prods input{padding:5px 6px;font-size:12px}
   table.prods th{color:var(--muted);font-weight:500}
   .rot-cell{text-align:center}
+  .modes{display:flex;gap:8px;margin-bottom:6px}
+  .modes label{display:flex;align-items:center;gap:5px;margin:0;font-size:13px;
+       color:var(--ink);cursor:pointer;border:1px solid var(--line);
+       border-radius:5px;padding:7px 10px;flex:1}
+  .modes input{margin:0}
+  .modes label.on{border-color:var(--brand);background:var(--brand2)}
   button{cursor:pointer;border:1px solid var(--brand);background:var(--brand);
          color:#fff;border-radius:5px;padding:8px 14px;font-size:13px;font-family:inherit}
   button.secondary{background:#fff;color:var(--brand)}
@@ -44,7 +49,8 @@
   button:disabled{opacity:.5;cursor:not-allowed}
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
   .badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px;font-weight:600}
-  .badge.found{background:var(--okbg);color:var(--ok)}
+  .badge.found{background:var(--warnbg);color:var(--warn)}
+  .badge.optimal{background:var(--okbg);color:var(--ok)}
   .badge.budget{background:var(--warnbg);color:var(--warn)}
   .badge.infeasible{background:var(--badbg);color:var(--bad)}
   .badge.none{background:#eef0f3;color:var(--muted)}
@@ -67,6 +73,9 @@
   table.cuts th{background:var(--brand2);font-weight:600}
   .counts{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
   .counts .chip{background:var(--brand2);border-radius:14px;padding:3px 12px;font-size:12px}
+  .costbox{border:1px solid var(--line);border-radius:6px;padding:8px 12px;margin:8px 0;
+           background:#fafbfd;font-size:13px}
+  .costbox .total{font-size:16px;font-weight:700;color:var(--brand)}
   .hint{font-size:12px;color:var(--muted);margin-top:6px}
   .errfield{border-color:var(--bad)!important}
 </style>
@@ -74,20 +83,47 @@
 <body>
 <header>
   <h1>矩形纸张贯通式裁切排样</h1>
-  <div class="sub">输入母纸与成品参数，搜索满足全部份数的 guillotine（每刀贯穿当前余料）排样方案</div>
+  <div class="sub">单规格母纸或多规格库存：在刀缝、份数、旋转与张数约束内搜索贯通式排样；库存模式按总纸价最低择优</div>
 </header>
 
 <main>
   <!-- 左栏：输入 -->
   <section>
     <div class="card">
-      <h2>母纸与搜索参数</h2>
-      <div class="grid2">
-        <div><label>母纸长 L（mm，正整数）</label>
-          <input id="paper_l" type="number" min="1" step="1" value="300"></div>
-        <div><label>母纸宽 W（mm，正整数）</label>
-          <input id="paper_w" type="number" min="1" step="1" value="220"></div>
+      <h2>母纸来源</h2>
+      <div class="modes">
+        <label id="mode_single_lbl"><input type="radio" name="mode" id="mode_single" value="single" checked>
+          单规格母纸（旧模式）</label>
+        <label id="mode_stock_lbl"><input type="radio" name="mode" id="mode_stock" value="stock">
+          多规格库存（按成本择优）</label>
       </div>
+      <div id="single_box">
+        <div class="grid2">
+          <div><label>母纸长 L（mm，正整数）</label>
+            <input id="paper_l" type="number" min="1" step="1" value="300"></div>
+          <div><label>母纸宽 W（mm，正整数）</label>
+            <input id="paper_w" type="number" min="1" step="1" value="220"></div>
+        </div>
+        <div class="hint">单一规格、库存不限；找到可行排样即返回，不追求成本最优。</div>
+      </div>
+      <div id="stock_box" style="display:none">
+        <label>库存规格清单（录入顺序即同价平局时的优先顺序）</label>
+        <table class="prods">
+          <thead><tr>
+            <th>名称</th><th>长</th><th>宽</th><th>可用</th><th>单价</th><th></th>
+          </tr></thead>
+          <tbody id="stock_rows"></tbody>
+        </table>
+        <div class="row" style="margin-top:6px">
+          <button class="secondary" id="btn_add_stock" type="button">+ 添加库存规格</button>
+        </div>
+        <div class="hint">每种规格记录长宽（正整数 mm）、可用张数（正整数）与非负整数单张成本；
+          总张数上限对各规格合计用纸生效。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>刀缝与搜索参数</h2>
       <div class="grid2">
         <div><label>刀缝宽度（mm，非负整数）</label>
           <input id="kerf" type="number" min="0" step="1" value="3"></div>
@@ -161,30 +197,68 @@
 const $ = id => document.getElementById(id);
 let STATE = null;          // 服务端 /api/state
 let dirty = false;         // 页面输入是否相对已保存输入有改动
+let mode = "single";
 const COLORS = ["#bcd3ec","#c9e4c5","#f3d9b1","#e6c6e2","#c6e4e0",
                 "#f2c6c6","#d8dcc0","#cdc6e8","#f0e6b8","#bfe0ef",
                 "#e2d3bd","#d6e8b8"];
 const WASTE_COLOR = "#eee";
+
+/* ---------- 模式切换 ---------- */
+function setMode(m){
+  mode = m;
+  $("mode_single").checked = (m === "single");
+  $("mode_stock").checked = (m === "stock");
+  $("single_box").style.display = (m === "single") ? "block" : "none";
+  $("stock_box").style.display = (m === "stock") ? "block" : "none";
+  $("mode_single_lbl").classList.toggle("on", m === "single");
+  $("mode_stock_lbl").classList.toggle("on", m === "stock");
+  markDirty();
+}
+$("mode_single").onchange = ()=>setMode("single");
+$("mode_stock").onchange = ()=>setMode("stock");
 
 /* ---------- 成品行 ---------- */
 function addProdRow(p){
   const tr = document.createElement("tr");
   tr.innerHTML = `
     <td><input class="p-name" type="text" maxlength="40" value="${(p?.name)||""}"></td>
-    <td><input class="p-l" type="number" min="1" step="1" value="${p?.l??100}" style="width:64px"></td>
-    <td><input class="p-w" type="number" min="1" step="1" value="${p?.w??80}" style="width:64px"></td>
-    <td><input class="p-qty" type="number" min="1" step="1" value="${p?.qty??10}" style="width:60px"></td>
+    <td><input class="p-l" type="number" min="1" step="1" value="${p?.l??100}" style="width:54px"></td>
+    <td><input class="p-w" type="number" min="1" step="1" value="${p?.w??80}" style="width:54px"></td>
+    <td><input class="p-qty" type="number" min="1" step="1" value="${p?.qty??10}" style="width:52px"></td>
     <td class="rot-cell"><input class="p-rot" type="checkbox" ${p?.rotatable===false?"":"checked"}></td>
     <td><button class="ghost p-del" type="button">删</button></td>`;
   tr.querySelector(".p-del").onclick = ()=>{ tr.remove(); markDirty(); };
   tr.querySelectorAll("input").forEach(i=>i.addEventListener("input", markDirty));
   $("prod_rows").appendChild(tr);
 }
+
+/* ---------- 库存行 ---------- */
+function addStockRow(s){
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td><input class="s-name" type="text" maxlength="40" value="${(s?.name)||""}"></td>
+    <td><input class="s-l" type="number" min="1" step="1" value="${s?.l??300}" style="width:54px"></td>
+    <td><input class="s-w" type="number" min="1" step="1" value="${s?.w??220}" style="width:54px"></td>
+    <td><input class="s-qty" type="number" min="1" step="1" value="${s?.qty??10}" style="width:52px"></td>
+    <td><input class="s-cost" type="number" min="0" step="1" value="${s?.cost??100}" style="width:60px"></td>
+    <td><button class="ghost s-del" type="button">删</button></td>`;
+  tr.querySelector(".s-del").onclick = ()=>{ tr.remove(); markDirty(); };
+  tr.querySelectorAll("input").forEach(i=>i.addEventListener("input", markDirty));
+  $("stock_rows").appendChild(tr);
+}
+function readStocks(){
+  return [...document.querySelectorAll("#stock_rows tr")].map((tr,i)=>({
+    name: tr.querySelector(".s-name").value.trim() || ("规格"+(i+1)),
+    l: Number(tr.querySelector(".s-l").value),
+    w: Number(tr.querySelector(".s-w").value),
+    qty: Number(tr.querySelector(".s-qty").value),
+    cost: Number(tr.querySelector(".s-cost").value),
+  }));
+}
+
 function readForm(){
   const rows = [...document.querySelectorAll("#prod_rows tr")];
-  return {
-    paper_l: Number($("paper_l").value),
-    paper_w: Number($("paper_w").value),
+  const body = {
     kerf: Number($("kerf").value),
     max_sheets: Number($("max_sheets").value),
     max_states: Number($("max_states").value),
@@ -196,9 +270,23 @@ function readForm(){
       rotatable: tr.querySelector(".p-rot").checked,
     }))
   };
+  if(mode === "stock"){
+    body.stocks = readStocks();
+  }else{
+    body.paper_l = Number($("paper_l").value);
+    body.paper_w = Number($("paper_w").value);
+  }
+  return body;
 }
 function fillForm(cfg){
-  $("paper_l").value=cfg.paper_l; $("paper_w").value=cfg.paper_w;
+  setMode(cfg.mode === "stock" ? "stock" : "single");
+  if(cfg.mode === "stock"){
+    $("stock_rows").innerHTML="";
+    (cfg.stocks||[]).forEach(addStockRow);
+    if(!(cfg.stocks||[]).length) addStockRow();
+  }else{
+    $("paper_l").value=cfg.paper_l; $("paper_w").value=cfg.paper_w;
+  }
   $("kerf").value=cfg.kerf; $("max_sheets").value=cfg.max_sheets;
   $("max_states").value=cfg.max_states;
   $("prod_rows").innerHTML="";
@@ -208,9 +296,12 @@ function markDirty(){ dirty=true; refreshButtons(); }
 document.querySelectorAll("#paper_l,#paper_w,#kerf,#max_sheets,#max_states")
   .forEach(i=>i.addEventListener("input", markDirty));
 $("btn_add").onclick = ()=>{ addProdRow(); markDirty(); };
-// 首次进入默认提供两行成品
+$("btn_add_stock").onclick = ()=>{ addStockRow(); markDirty(); };
+// 首次进入默认提供两行成品与两行库存
 addProdRow({name:"",l:100,w:80,qty:10,rotatable:true});
 addProdRow({name:"",l:60,w:60,qty:5,rotatable:true});
+addStockRow({name:"",l:300,w:220,qty:10,cost:100});
+addStockRow({name:"",l:250,w:200,qty:10,cost:80});
 
 /* ---------- 提示 ---------- */
 function banner(el, kind, html){
@@ -222,7 +313,8 @@ function refreshButtons(){
   const has = STATE && STATE.has_input;
   $("btn_solve").disabled = !has;
   const sol = STATE && STATE.solution;
-  const exportable = has && sol && sol.fresh && sol.status==="found";
+  const exportable = has && sol && sol.fresh &&
+                     (sol.status==="found" || sol.status==="optimal");
   $("btn_export").disabled = !exportable;
 }
 
@@ -285,6 +377,19 @@ $("btn_export").onclick = ()=>{ window.location = "/api/export"; };
 function esc(s){ return String(s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
+function isStock(){
+  return !!(STATE.cfg && (STATE.cfg.mode === "stock" ||
+         (STATE.cfg.stocks && STATE.cfg.stocks.length)));
+}
+/* 第 si 张（按使用序号）母纸的尺寸 */
+function sheetSize(si){
+  if(isStock()){
+    const s = STATE.cfg.stocks[STATE.solution.result.sheet_specs[si]];
+    return {L:s.l, W:s.w};
+  }
+  return {L:STATE.cfg.paper_l, W:STATE.cfg.paper_w};
+}
+
 function renderSolution(){
   const sol = STATE && STATE.solution;
   const badge=$("sol_badge"), meta=$("sol_meta"), sb=$("sol_banner");
@@ -298,22 +403,35 @@ function renderSolution(){
     return;
   }
   const st = sol.status;
-  badge.className = "badge "+(st==="found"?"found":st);
-  badge.textContent = st==="found" ? "找到可行方案"
-    : st==="infeasible" ? "无解（已穷尽搜索）" : "搜索预算耗尽";
+  const stock = isStock();
+  badge.className = "badge "+(st==="found" && !stock ? "found" : st);
+  badge.textContent =
+    st==="optimal" ? "已证实成本最优"
+    : st==="found" ? (stock ? "可行方案（最优性未证实）" : "找到可行方案")
+    : st==="infeasible" ? "无解（已穷尽搜索）"
+    : "搜索预算耗尽（未判定）";
   meta.textContent = `方案版本 ${sol.input_version} · 搜索状态 ${sol.result.states_searched} · 生成于 ${sol.created_at} UTC`;
 
   if(!sol.fresh){
     banner(sb,"bad","该方案对应的是旧输入版本，已失效；导出被拒绝。请重新排样。");
+  } else if(st==="optimal"){
+    banner(sb,"ok",`已完整穷尽搜索：本方案总纸价 <b>${sol.result.total_cost}</b> 为最低；`+
+      `同价情况下用纸张数最少，并优先使用录入靠前的规格。共使用 ${sol.result.sheets_used} 张母纸。`);
   } else if(st==="found"){
-    banner(sb,"ok",`已找到满足全部份数的可行排样（不保证最优）：实际使用 ${sol.result.sheets_used} 张母纸。`);
+    if(stock){
+      banner(sb,"warn",`已找到满足全部份数的可行排样（总纸价 <b>${sol.result.total_cost}</b>，`+
+        `${sol.result.sheets_used} 张），但搜索预算耗尽，<b>最优性未证实</b>。`+
+        `可调大「搜索状态数上限」后重新排样以尝试证实最优。`);
+    }else{
+      banner(sb,"ok",`已找到满足全部份数的可行排样（不保证最优）：实际使用 ${sol.result.sheets_used} 张母纸。`);
+    }
   } else if(st==="infeasible"){
-    banner(sb,"bad","搜索已完整穷尽，在给定母纸尺寸、刀缝、张数上限与旋转限制下<b>不存在</b>可行排样。可放宽张数/尺寸/旋转后重试。");
+    banner(sb,"bad","搜索已完整穷尽，在给定库存/母纸尺寸、刀缝、张数上限与旋转限制下<b>不存在</b>可行排样。可放宽张数/尺寸/旋转后重试。");
   } else {
-    banner(sb,"warn","搜索状态数预算耗尽，<b>不能据此声称无解</b>。请调大「搜索状态数上限」后重新排样。");
+    banner(sb,"warn","搜索状态数预算耗尽，尚未找到可行排样，结果<b>未判定（不表示无解）</b>。请调大「搜索状态数上限」后重新排样。");
   }
 
-  if(st!=="found"){
+  if(st!=="found" && st!=="optimal"){
     $("summary").innerHTML="";
     $("layout_card").style.display="none";
     $("cuts_card").style.display="none";
@@ -333,20 +451,36 @@ function renderSummary(res){
     return `<span class="chip" style="${ok?"":"background:var(--badbg);color:var(--bad)"}">
       ${esc(p.name)} ${p.l}×${p.w}：需求 ${p.qty} / 实得 ${got}</span>`;
   }).join("");
+  let costHtml = "";
+  if(isStock()){
+    const usage = {};
+    (res.sheet_specs||[]).forEach(i=>usage[i]=(usage[i]||0)+1);
+    const rows = STATE.cfg.stocks.map((s,i)=>{
+      const n = usage[i]||0;
+      return `<tr><td>规格${i} ${esc(s.name)}</td><td>${s.l}×${s.w}</td>
+        <td>${n} / ${s.qty}</td><td>${s.cost}</td><td>${n*s.cost}</td></tr>`;
+    }).join("");
+    costHtml = `<div class="costbox">
+      <div class="total">总纸价：${res.total_cost}</div>
+      <table style="font-size:12px;border-collapse:collapse;margin-top:6px">
+        <thead><tr><th style="text-align:left">规格</th><th style="text-align:left;padding:0 10px">尺寸</th>
+        <th style="text-align:left;padding:0 10px">用纸/库存</th>
+        <th style="text-align:left;padding:0 10px">单价</th><th style="text-align:left">小计</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      <div class="meta">最优性：${res.optimal ? "已证实（完整穷尽搜索）" :
+        "未证实（搜索预算耗尽）"}</div></div>`;
+  }
   $("summary").innerHTML =
-    `<div class="counts">${chips}</div>
+    `${costHtml}<div class="counts">${chips}</div>
      <div class="meta">实际成品总数 ${res.counts.reduce((a,b)=>a+b,0)}，
      使用母纸 ${res.sheets_used} / 上限 ${STATE.cfg.max_sheets} 张。</div>`;
 }
 
 /* ---------- SVG 排样图 ---------- */
 function renderSheets(res){
-  const {paper_l:L, paper_w:W, kerf:k} = STATE.cfg;
+  const k = STATE.cfg.kerf;
   const prods = STATE.cfg.products;
-  // 等比缩放到最大宽 ~520
-  const scale = Math.min(520/L, 4) ;
-  const sw = L*scale, sh = W*scale;
-
+  const stock = isStock();
   $("legend").innerHTML = prods.map((p,i)=>
     `<span><span class="sw" style="background:${COLORS[i%COLORS.length]}"></span>${esc(p.name)} ${p.l}×${p.w}</span>`
   ).join("") + `<span><span class="sw" style="background:${WASTE_COLOR}"></span>余料/废纸</span>
@@ -359,8 +493,19 @@ function renderSheets(res){
 
   let html="";
   for(let si=0; si<res.sheets_used; si++){
+    const {L, W} = sheetSize(si);
     const pieces = bySheet[si]||[];
     const cuts = cutBySheet[si]||[];
+    const scale = Math.min(520/L, 4);
+    const sw = L*scale, sh = W*scale;
+    let head;
+    if(stock){
+      const spec = STATE.cfg.stocks[res.sheet_specs[si]];
+      head = `第 ${si+1} 张：规格${res.sheet_specs[si]}（${esc(spec.name)}）
+        ${L}×${W} mm，单价 ${spec.cost}，${pieces.length} 件成品，${cuts.length} 刀`;
+    }else{
+      head = `第 ${si+1} 张母纸（${L}×${W} mm，${pieces.length} 件成品，${cuts.length} 刀）`;
+    }
     let s = `<svg class="paper" width="${sw+2}" height="${sh+2}" viewBox="-1 -1 ${L+2} ${W+2}">`;
     // 刀缝（先画带状，再画成品覆盖其上）
     cuts.forEach(c=>{
@@ -385,8 +530,7 @@ function renderSheets(res){
               font-size="${Math.max(7,fs*0.8)}" fill="#7a2f2f">旋</text>`;
     });
     s += `</svg>`;
-    html += `<div class="sheet-block"><h3>第 ${si+1} 张母纸（${L}×${W} mm，
-            ${pieces.length} 件成品，${cuts.length} 刀）</h3>
+    html += `<div class="sheet-block"><h3>${head}</h3>
             <div class="sheet-wrap">${s}</div></div>`;
   }
   $("sheets").innerHTML = html;
@@ -399,7 +543,14 @@ function renderCuts(res){
   let html="";
   for(let si=0; si<res.sheets_used; si++){
     const cuts = (by[si]||[]).slice().sort((a,b)=>a.order-b.order);
-    html += `<h3 style="font-size:13px;margin:12px 0 4px">第 ${si+1} 张</h3>
+    let head;
+    if(isStock()){
+      const s = STATE.cfg.stocks[res.sheet_specs[si]];
+      head = `第 ${si+1} 张 · 规格${res.sheet_specs[si]}（${esc(s.name)}）${s.l}×${s.w} mm`;
+    }else{
+      head = `第 ${si+1} 张`;
+    }
+    html += `<h3 style="font-size:13px;margin:12px 0 4px">${head}</h3>
       <table class="cuts"><thead><tr>
       <th>全局顺序</th><th>张内顺序</th><th>方向</th><th>x (mm)</th><th>y (mm)</th>
       <th>刀长 (mm)</th><th>说明</th></tr></thead><tbody>`;

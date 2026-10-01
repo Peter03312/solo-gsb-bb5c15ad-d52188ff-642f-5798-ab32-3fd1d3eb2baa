@@ -1,10 +1,18 @@
 """严格输入校验与输入版本指纹。
 
-规则：
-- 母纸长/宽：正整数毫米（1..MAX_DIM）
+两种输入模式：
+
+- 旧模式（请求体不含 ``stocks`` 字段）：单一母纸规格，保持原语义：
+  - 母纸长/宽：正整数毫米（1..MAX_DIM）
+- 库存模式（请求体含 ``stocks`` 字段，且为非空数组）：母纸来自库存，
+  不再使用顶层 paper_l/paper_w（出现即报 400，避免“改了不生效”的误解），
+  张数上限同时受各规格可用张数与总张数约束。
+
+公共规则：
 - 刀缝：非负整数毫米（0..MAX_KERF）
 - 张数上限、搜索状态数上限：正整数（1..对应上限）
 - 成品：至少 1 种；长/宽正整数，份数正整数，rotatable 为布尔
+- 库存规格：至少 1 种；长/宽正整数，可用张数正整数，单张成本非负整数
 - 布尔值不接受 int 伪装（Python 中 True 是 int 的子类）
 
 校验失败抛出 ValidationError(字段名, 原因)，任何调用方都不得把非法
@@ -22,8 +30,10 @@ MAX_KERF = 100
 MAX_SHEETS = 10_000
 MAX_STATES = 100_000_000
 MAX_PRODUCT_KINDS = 50
+MAX_STOCK_KINDS = 20
 MAX_NAME = 40
 MAX_QTY = 1_000_000
+MAX_COST = 1_000_000_000
 
 
 class ValidationError(ValueError):
@@ -50,13 +60,35 @@ def validate_input(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValidationError("body", "请求体必须是 JSON 对象")
 
-    paper_l = _check_int(payload.get("paper_l"), "paper_l", 1, MAX_DIM)
-    paper_w = _check_int(payload.get("paper_w"), "paper_w", 1, MAX_DIM)
+    stocks_field_present = "stocks" in payload and payload.get("stocks") is not None
+    raw_stocks = payload.get("stocks")
+    stock_mode = stocks_field_present
+    if stocks_field_present:
+        if not isinstance(raw_stocks, list) or not raw_stocks:
+            raise ValidationError("stocks", "库存清单必须是非空数组；"
+                                            "如使用单规格母纸请省略 stocks 字段")
+        if len(raw_stocks) > MAX_STOCK_KINDS:
+            raise ValidationError("stocks",
+                                  f"库存规格至多 {MAX_STOCK_KINDS} 种")
+
     kerf = _check_int(payload.get("kerf"), "kerf", 0, MAX_KERF)
     max_sheets = _check_int(payload.get("max_sheets"), "max_sheets",
                             1, MAX_SHEETS)
     max_states = _check_int(payload.get("max_states"), "max_states",
                             1, MAX_STATES)
+
+    if stock_mode:
+        # 库存模式：顶层母纸尺寸不再使用；显式给出即拒绝，防止误以为生效。
+        for f in ("paper_l", "paper_w"):
+            if payload.get(f) is not None:
+                raise ValidationError(
+                    f, "库存模式下母纸尺寸由 stocks 提供，"
+                       "请删除顶层 paper_l/paper_w")
+        stocks = _validate_stocks(raw_stocks)
+    else:
+        paper_l = _check_int(payload.get("paper_l"), "paper_l", 1, MAX_DIM)
+        paper_w = _check_int(payload.get("paper_w"), "paper_w", 1, MAX_DIM)
+        stocks = []
 
     raw_products = payload.get("products")
     if not isinstance(raw_products, list) or not raw_products:
@@ -82,21 +114,41 @@ def validate_input(payload: Dict[str, Any]) -> Dict[str, Any]:
         products.append({"name": name, "l": l, "w": w,
                          "qty": qty, "rotatable": rot})
 
-    return {
-        "paper_l": paper_l,
-        "paper_w": paper_w,
+    cfg: Dict[str, Any] = {
         "kerf": kerf,
         "max_sheets": max_sheets,
         "max_states": max_states,
         "products": products,
+        "stocks": stocks,
     }
+    if not stock_mode:
+        cfg["paper_l"] = paper_l
+        cfg["paper_w"] = paper_w
+    return cfg
+
+
+def _validate_stocks(raw_stocks: list) -> List[dict]:
+    stocks: List[dict] = []
+    for idx, s in enumerate(raw_stocks):
+        fp = f"stocks[{idx}]"
+        if not isinstance(s, dict):
+            raise ValidationError(fp, "必须是对象")
+        l = _check_int(s.get("l"), f"{fp}.l", 1, MAX_DIM)
+        w = _check_int(s.get("w"), f"{fp}.w", 1, MAX_DIM)
+        qty = _check_int(s.get("qty"), f"{fp}.qty", 1, MAX_QTY)
+        cost = _check_int(s.get("cost"), f"{fp}.cost", 0, MAX_COST)
+        name = s.get("name") or f"规格{idx + 1}"
+        if not isinstance(name, str):
+            raise ValidationError(f"{fp}.name", "名称必须是字符串")
+        name = name.strip()[:MAX_NAME] or f"规格{idx + 1}"
+        stocks.append({"name": name, "l": l, "w": w,
+                       "qty": qty, "cost": cost})
+    return stocks
 
 
 def canonical_inputs(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """去掉名称等不影响排样的字段，得到决定方案有效性的规范输入。"""
-    return {
-        "paper_l": cfg["paper_l"],
-        "paper_w": cfg["paper_w"],
+    common = {
         "kerf": cfg["kerf"],
         "max_sheets": cfg["max_sheets"],
         "max_states": cfg["max_states"],
@@ -105,6 +157,16 @@ def canonical_inputs(cfg: Dict[str, Any]) -> Dict[str, Any]:
             for p in cfg["products"]
         ],
     }
+    if cfg.get("stocks"):
+        # 库存模式：规格录入顺序也是决策输入（决定平局优先序）。
+        common["stocks"] = [
+            [s["l"], s["w"], s["qty"], s["cost"]]
+            for s in cfg["stocks"]
+        ]
+    else:
+        common["paper_l"] = cfg["paper_l"]
+        common["paper_w"] = cfg["paper_w"]
+    return common
 
 
 def input_hash(cfg: Dict[str, Any]) -> str:
