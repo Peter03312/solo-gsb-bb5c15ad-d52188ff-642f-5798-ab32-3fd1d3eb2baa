@@ -1,0 +1,24 @@
+services:
+  cutting-planner:
+    build: .
+    image: paper-cutting-planner:latest
+    container_name: paper-cutting-planner
+    ports:
+      - "8000:8000"
+    environment:
+      # 监听端口（容器内）；与左侧映射右值保持一致
+      PORT: "8000"
+      # SQLite 数据库文件路径
+      CUTTING_DB: "/app/data/cutting.db"
+    volumes:
+      - cutting-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/state').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  cutting-data:
