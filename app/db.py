@@ -11,12 +11,17 @@ SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schema.sql")
 
 
 def init_db(db_path: str) -> None:
-    """幂等建表。"""
+    """幂等建表，并为旧版数据库补齐新增列/表。"""
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
             conn.executescript(f.read())
+        # 旧版 job 表没有 mode 列：补齐，既有行保持 legacy 语义。
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(job)")}
+        if "mode" not in cols:
+            conn.execute("ALTER TABLE job ADD COLUMN mode TEXT NOT NULL "
+                         "DEFAULT 'legacy'")
         conn.commit()
     finally:
         conn.close()
@@ -40,7 +45,9 @@ def get_job(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
     ]
     for p in products:
         p["rotatable"] = bool(p["rotatable"])
+    mode = row["mode"] if "mode" in row.keys() else "legacy"
     cfg = {
+        "mode": mode,
         "paper_l": row["paper_l"],
         "paper_w": row["paper_w"],
         "kerf": row["kerf"],
@@ -48,6 +55,12 @@ def get_job(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
         "max_states": row["max_states"],
         "products": products,
     }
+    if mode == "stock":
+        cfg["stocks"] = [
+            dict(r) for r in conn.execute(
+                "SELECT position, name, l, w, qty, cost FROM stock "
+                "ORDER BY position").fetchall()
+        ]
     return {"cfg": cfg, "input_hash": row["input_hash"],
             "updated_at": row["updated_at"]}
 
@@ -59,16 +72,18 @@ def save_job(conn: sqlite3.Connection, cfg: Dict[str, Any],
     任何修改输入的保存都会令旧方案失效：方案是否有效以其 input_hash
     是否等于工单当前 input_hash 判定。
     """
+    mode = cfg.get("mode", "legacy")
     conn.execute(
-        "INSERT INTO job(id, paper_l, paper_w, kerf, max_sheets, "
+        "INSERT INTO job(id, mode, paper_l, paper_w, kerf, max_sheets, "
         "max_states, input_hash, updated_at) "
-        "VALUES (1, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
         "ON CONFLICT(id) DO UPDATE SET "
+        "mode=excluded.mode, "
         "paper_l=excluded.paper_l, paper_w=excluded.paper_w, "
         "kerf=excluded.kerf, max_sheets=excluded.max_sheets, "
         "max_states=excluded.max_states, input_hash=excluded.input_hash, "
         "updated_at=datetime('now')",
-        (cfg["paper_l"], cfg["paper_w"], cfg["kerf"],
+        (mode, cfg["paper_l"], cfg["paper_w"], cfg["kerf"],
          cfg["max_sheets"], cfg["max_states"], input_hash),
     )
     conn.execute("DELETE FROM product")
@@ -79,6 +94,14 @@ def save_job(conn: sqlite3.Connection, cfg: Dict[str, Any],
             (pos, p["name"], p["l"], p["w"], p["qty"],
              1 if p["rotatable"] else 0),
         )
+    conn.execute("DELETE FROM stock")
+    if mode == "stock":
+        for pos, s in enumerate(cfg["stocks"]):
+            conn.execute(
+                "INSERT INTO stock(position, name, l, w, qty, cost) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (pos, s["name"], s["l"], s["w"], s["qty"], s["cost"]),
+            )
 
 
 def get_solution(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
